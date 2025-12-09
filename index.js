@@ -87,7 +87,7 @@ app.post("/webhook", async (req, res) => {
       if (!customerToTopic.has(customerId)) {
         await axios.post(`${API}/sendMessage`, {
           chat_id: customerId,
-          text: `Hola cariño ❤️\nSoy tu asistente, ¿en qué puedo ayudarte?`
+          text: `Bonjour, je m'appelle Lia. Souhaiteriez-vous que je vous présente ce poste ?`
         });
       }
 
