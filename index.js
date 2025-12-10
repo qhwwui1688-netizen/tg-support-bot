@@ -1,5 +1,6 @@
 import express from "express";
 import axios from "axios";
+import fs from "fs";
 
 const app = express();
 app.use(express.json());
@@ -15,15 +16,55 @@ console.log("🔧 WEBHOOK_URL =", WEBHOOK_URL);
 
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
+// ===================== 持久化存储 =====================
+const MAPPING_FILE = "./mapping.json";
+
 // 内存映射
-const customerToTopic = new Map(); // customerId -> topicId
-const topicToCustomer = new Map(); // topicId -> customerId
+const customerToTopic = new Map();          // customerId -> topicId
+const topicToCustomer = new Map();          // topicId -> customerId
+const customerMsgToGroupMsg = new Map();    // customerMsgId -> groupMsgId
+const groupMsgToCustomer = new Map();       // groupMsgId -> { customerId, customerMsgId }
+
+// --- 从文件加载映射 ---
+function loadMapping() {
+  if (!fs.existsSync(MAPPING_FILE)) {
+    console.log("📁 未找到 mapping.json，将创建新文件。");
+    return;
+  }
+
+  try {
+    const data = JSON.parse(fs.readFileSync(MAPPING_FILE, "utf8"));
+    data.customerToTopic?.forEach(([k, v]) => customerToTopic.set(k, v));
+    data.topicToCustomer?.forEach(([k, v]) => topicToCustomer.set(k, v));
+    data.customerMsgToGroupMsg?.forEach(([k, v]) => customerMsgToGroupMsg.set(k, v));
+    data.groupMsgToCustomer?.forEach(([k, v]) => groupMsgToCustomer.set(k, v));
+
+    console.log("📥 映射已加载。");
+  } catch (e) {
+    console.error("❌ 映射文件读取失败：", e.message);
+  }
+}
+
+// --- 保存映射到文件 ---
+function saveMapping() {
+  const data = {
+    customerToTopic: [...customerToTopic],
+    topicToCustomer: [...topicToCustomer],
+    customerMsgToGroupMsg: [...customerMsgToGroupMsg],
+    groupMsgToCustomer: [...groupMsgToCustomer],
+  };
+
+  fs.writeFileSync(MAPPING_FILE, JSON.stringify(data, null, 2));
+  console.log("💾 映射已保存。");
+}
+
+loadMapping();
 
 // ===================== 设置 Webhook =====================
 async function setWebhook() {
   try {
     const res = await axios.get(`${API}/setWebhook`, {
-      params: { url: WEBHOOK_URL }
+      params: { url: WEBHOOK_URL },
     });
     console.log("Webhook 已设置：", res.data);
   } catch (e) {
@@ -41,7 +82,7 @@ function logMessage(prefix, msg) {
   );
 }
 
-// ===================== 创建话题 =====================
+// ===================== 话题获取/创建 =====================
 async function getOrCreateTopic(customer) {
   const customerId = customer.id;
 
@@ -50,24 +91,24 @@ async function getOrCreateTopic(customer) {
   }
 
   const title = `客户 ${customerId}`;
-
   console.log("🧵 创建话题：", title);
 
   const res = await axios.post(`${API}/createForumTopic`, {
     chat_id: GROUP_CHAT_ID,
-    name: title
+    name: title,
   });
 
   const topicId = res.data?.result?.message_thread_id;
-  if (!topicId) throw new Error("createForumTopic 未返回 message_thread_id");
+  if (!topicId) throw new Error("createForumTopic 未返回 topicId");
 
   customerToTopic.set(customerId, topicId);
   topicToCustomer.set(topicId, customerId);
+  saveMapping();
 
   return topicId;
 }
 
-// ===================== 主 Webhook =====================
+// ===================== Webhook =====================
 app.post("/webhook", async (req, res) => {
   const update = req.body;
   const msg = update.message;
@@ -77,45 +118,51 @@ app.post("/webhook", async (req, res) => {
 
   const chatType = msg.chat.type;
 
-  // =============== 情况 1：客户私聊机器人 ===============
+  // =============== 1. 客户私聊机器人 ===============
   if (chatType === "private") {
     const customer = msg.from;
     const customerId = customer.id;
 
     try {
-      // 自动欢迎（只发一次）
+      // 首次欢迎
       if (!customerToTopic.has(customerId)) {
         await axios.post(`${API}/sendMessage`, {
           chat_id: customerId,
-          text: `Bonjour, je m'appelle Lia. Souhaiteriez-vous que je vous présente ce poste ?`
+          text: `Bonjour, je m'appelle Lia. Souhaiteriez-vous que je vous présente ce poste ?`,
         });
       }
 
-      // 获取 / 创建话题
+      // 话题
       const topicId = await getOrCreateTopic(customer);
 
-      // -------- 构建内容（无头部） --------
-      let content = msg.text || "";
-      if (!content) {
-        if (msg.photo) content = "[Imagen]";
-        else if (msg.document) content = "[Documento]";
-        else content = "[Mensaje no textual]";
-      }
+      // ----- 发到群 -----
+      let content = msg.text || "[消息]";
+      if (msg.photo) content = "[Imagen]";
+      if (msg.document) content = "[Documento]";
 
-      // ---- 把消息发到客服群对应话题（无客户信息前缀）----
-      await axios.post(`${API}/sendMessage`, {
+      const sent = await axios.post(`${API}/sendMessage`, {
         chat_id: GROUP_CHAT_ID,
         message_thread_id: topicId,
-        text: content
+        text: content,
       });
 
-      // 图片处理
+      const groupMsgId = sent.data.result.message_id;
+
+      // **保存消息映射（用于引用）**
+      customerMsgToGroupMsg.set(msg.message_id, groupMsgId);
+      groupMsgToCustomer.set(groupMsgId, {
+        customerId,
+        customerMsgId: msg.message_id,
+      });
+      saveMapping();
+
+      // 图片转发
       if (msg.photo) {
         const fileId = msg.photo[msg.photo.length - 1].file_id;
         await axios.post(`${API}/sendPhoto`, {
           chat_id: GROUP_CHAT_ID,
           message_thread_id: topicId,
-          photo: fileId
+          photo: fileId,
         });
       }
     } catch (e) {
@@ -125,41 +172,53 @@ app.post("/webhook", async (req, res) => {
     return res.sendStatus(200);
   }
 
-  // =============== 情况 2：客服在群内回复 ===============
+  // =============== 2. 客服在群内回复 ===============
   if (chatType === "supergroup") {
-    if (String(msg.chat.id) !== GROUP_CHAT_ID) {
-      return res.sendStatus(200);
-    }
+    if (String(msg.chat.id) !== GROUP_CHAT_ID) return res.sendStatus(200);
 
     const topicId = msg.message_thread_id;
     if (!topicId) return res.sendStatus(200);
 
-    // 不处理机器人消息
     if (msg.from.is_bot) return res.sendStatus(200);
 
     const customerId = topicToCustomer.get(topicId);
-    if (!customerId) {
-      console.log("⚠️ 找不到对应客户 topicId =", topicId);
-      return res.sendStatus(200);
-    }
+    if (!customerId) return res.sendStatus(200);
 
     try {
-      // 图片
+      // ========== 判断客服是否对客户消息“回复” ==========
+      if (msg.reply_to_message) {
+        const repliedGroupMsgId = msg.reply_to_message.message_id;
+        const mapping = groupMsgToCustomer.get(repliedGroupMsgId);
+
+        if (mapping) {
+          const { customerId, customerMsgId } = mapping;
+
+          // ------ 带引用回复客户 ------
+          await axios.post(`${API}/sendMessage`, {
+            chat_id: customerId,
+            text: msg.text,
+            reply_to_message_id: customerMsgId, // 引用！
+          });
+
+          return res.sendStatus(200);
+        }
+      }
+
+      // ========== 普通文本 (无引用) ==========
+      if (msg.text) {
+        await axios.post(`${API}/sendMessage`, {
+          chat_id: customerId,
+          text: msg.text,
+        });
+      }
+
+      // ========== 图片 ==========
       if (msg.photo) {
         const fileId = msg.photo[msg.photo.length - 1].file_id;
         await axios.post(`${API}/sendPhoto`, {
           chat_id: customerId,
           photo: fileId,
-          caption: msg.caption || ""
-        });
-        return res.sendStatus(200);
-      }
-
-      // 文本
-      if (msg.text) {
-        await axios.post(`${API}/sendMessage`, {
-          chat_id: customerId,
-          text: msg.text
+          caption: msg.caption || "",
         });
       }
     } catch (e) {
