@@ -124,18 +124,18 @@ app.post("/webhook", async (req, res) => {
     const customerId = customer.id;
 
     try {
-      // 首次欢迎
+      // ===== 首次欢迎（已修改）=====
       if (!customerToTopic.has(customerId)) {
         await axios.post(`${API}/sendMessage`, {
           chat_id: customerId,
-          text: `Bonjour, je m'appelle Lia. Souhaiteriez-vous que je vous présente ce poste ?`,
+          text: "Hola soy Lia, ¿cómo debería llamarte?",
         });
       }
 
-      // 话题
+      // 获取 / 创建话题
       const topicId = await getOrCreateTopic(customer);
 
-      // ----- 发到群 -----
+      // ----- 转发到群 -----
       let content = msg.text || "[消息]";
       if (msg.photo) content = "[Imagen]";
       if (msg.document) content = "[Documento]";
@@ -148,7 +148,7 @@ app.post("/webhook", async (req, res) => {
 
       const groupMsgId = sent.data.result.message_id;
 
-      // **保存消息映射（用于引用）**
+      // 保存消息映射（用于引用）
       customerMsgToGroupMsg.set(msg.message_id, groupMsgId);
       groupMsgToCustomer.set(groupMsgId, {
         customerId,
@@ -178,14 +178,13 @@ app.post("/webhook", async (req, res) => {
 
     const topicId = msg.message_thread_id;
     if (!topicId) return res.sendStatus(200);
-
     if (msg.from.is_bot) return res.sendStatus(200);
 
     const customerId = topicToCustomer.get(topicId);
     if (!customerId) return res.sendStatus(200);
 
     try {
-      // ========== 判断客服是否对客户消息“回复” ==========
+      // ===== 引用回复 =====
       if (msg.reply_to_message) {
         const repliedGroupMsgId = msg.reply_to_message.message_id;
         const mapping = groupMsgToCustomer.get(repliedGroupMsgId);
@@ -193,18 +192,17 @@ app.post("/webhook", async (req, res) => {
         if (mapping) {
           const { customerId, customerMsgId } = mapping;
 
-          // ------ 带引用回复客户 ------
           await axios.post(`${API}/sendMessage`, {
             chat_id: customerId,
             text: msg.text,
-            reply_to_message_id: customerMsgId, // 引用！
+            reply_to_message_id: customerMsgId,
           });
 
           return res.sendStatus(200);
         }
       }
 
-      // ========== 普通文本 (无引用) ==========
+      // 普通文本
       if (msg.text) {
         await axios.post(`${API}/sendMessage`, {
           chat_id: customerId,
@@ -212,7 +210,7 @@ app.post("/webhook", async (req, res) => {
         });
       }
 
-      // ========== 图片 ==========
+      // 图片
       if (msg.photo) {
         const fileId = msg.photo[msg.photo.length - 1].file_id;
         await axios.post(`${API}/sendPhoto`, {
